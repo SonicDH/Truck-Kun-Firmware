@@ -1,0 +1,303 @@
+/*****************************************************************************************
+   KEI TRUCK — Steering Firmware
+   ---------------------------------------------------------
+   This is setup around having a Nema17 Stepper connected to DRV8825 Stepper motor driver 
+   and a standard potentiometer to provide absolute positioning.
+   There is a homing routine on startup that tries to bring the potentiometer to the centerpoint
+   which is calculated by POT_MAX - POT_MIN
+
+******************************************************************************************/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <hardware/sync.h>
+#include "i2c_packet_structs.h"
+#include <Adafruit_NeoPixel.h>
+#include <AccelStepper.h>
+
+// ===============================
+// CONFIGURATION
+// ===============================
+
+static const uint8_t DEVICE_I2C_ADDRESS = 0x20;
+static const uint32_t PACKET_TIMEOUT_MS = 300;
+
+// Stepper pins (DRV8825)
+const int STEP_PIN        = 27;
+const int DIR_PIN         = 28;
+const int ENABLE_PIN      = 26;
+const int FAULT_PIN       = 15;
+const int SLEEP_RESET_PIN = 14;
+
+// Pot
+const int POT_PIN = A3;
+
+// Pot calibration
+const int POT_MIN    = 380;
+const int POT_MAX    = 620;
+
+// Stepper homing range
+const int STEPPER_MIN = -500;
+const int STEPPER_MAX =  500;
+
+// Control tuning
+#define POSITION_TOLERANCE 5   // pot counts
+
+// Status LED
+#define HEADLIGHT_PIN 16
+Adafruit_NeoPixel pixel(1, HEADLIGHT_PIN, NEO_GRB + NEO_KHZ800);
+
+// ===============================
+// SHARED STATE
+// ===============================
+
+struct SharedState {
+    steeringpacket latest_packet;
+    uint32_t last_packet_ms;
+    bool estop_from_master;
+    bool estop_from_device;
+    bool seen_packet;
+    char estop_reason[64];
+};
+
+SharedState shared_state;
+spin_lock_t* lockPtr = nullptr;
+
+inline void lock_shared()   { spin_lock_unsafe_blocking(lockPtr); }
+inline void unlock_shared() { spin_unlock_unsafe(lockPtr); }
+
+// ===============================
+// STEPPER
+// ===============================
+
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+
+inline void enableDriver()  { digitalWrite(ENABLE_PIN, LOW); }
+inline void disableDriver() { digitalWrite(ENABLE_PIN, HIGH); }
+
+// ===============================
+// POT HELPERS
+// ===============================
+
+int readPot() {
+    return analogRead(POT_PIN);
+}
+
+int commandToPotTarget(int16_t cmd) {
+    return map(cmd, -512, 512, POT_MAX, POT_MIN); // inverted
+}
+
+int potToSteps(int pot) {
+    return map(pot, POT_MIN, POT_MAX, STEPPER_MIN, STEPPER_MAX);
+}
+
+// ===============================
+// HOMING
+// ===============================
+
+void performHoming() {
+    Serial.println("=== HOMING ===");
+
+    int pot = readPot();
+    stepper.setCurrentPosition(potToSteps(pot));
+    stepper.moveTo(0);
+
+    enableDriver();
+    while (stepper.distanceToGo() != 0) {
+        stepper.run();
+        if (digitalRead(FAULT_PIN) == LOW) {
+            disableDriver();
+            lock_shared();
+            shared_state.estop_from_device = true;
+            strcpy(shared_state.estop_reason, "DRV8825 fault during homing");
+            unlock_shared();
+            return;
+        }
+    }
+
+    disableDriver();
+    delay(100);
+    Serial.println("Homing complete");
+}
+
+// ===============================
+// FAULTS
+// ===============================
+
+void triggerEstop(const char* reason) {
+    lock_shared();
+    shared_state.estop_from_device = true;
+    strncpy(shared_state.estop_reason, reason, sizeof(shared_state.estop_reason));
+    unlock_shared();
+    Serial.printf("ESTOP: %s\n", reason);
+}
+
+void checkDriverFault() {
+    if (digitalRead(FAULT_PIN) == LOW) {
+        triggerEstop("DRV8825 fault");
+    }
+}
+
+// ===============================
+// STEERING CONTROL
+// ===============================
+
+void driveTowardTarget(int targetPot) {
+    // Filter pot noise
+    static float filteredPot = readPot();
+    float raw = readPot();
+    filteredPot = (filteredPot * 0.9f) + (raw * 0.1f);
+
+    int pot = (int)filteredPot;
+
+    // Convert to step positions
+    int targetSteps = potToSteps(targetPot);
+    targetSteps = constrain(targetSteps, STEPPER_MIN, STEPPER_MAX);
+
+    stepper.moveTo(targetSteps);
+
+    // Settling logic to avoid flicker
+    static uint8_t settleCount = 0;
+
+    bool potAtTarget = abs(targetPot - pot) <= POSITION_TOLERANCE;
+    bool stepperAtTarget = abs(stepper.distanceToGo()) <= 2;
+
+    if (potAtTarget && stepperAtTarget) {
+        if (settleCount < 5) {
+            settleCount++;
+            enableDriver();
+            stepper.run();
+            return;
+        }
+        stepper.stop();
+        disableDriver();
+        return;
+    }
+
+    // Not settled, keep moving
+    settleCount = 0;
+    enableDriver();
+    stepper.run();
+}
+
+// ===============================
+// DEVICE LOGIC
+// ===============================
+
+void deviceSetup() {
+    pixel.begin();
+    pixel.setBrightness(50);
+    pixel.show();
+
+    pinMode(ENABLE_PIN, OUTPUT);
+    pinMode(FAULT_PIN, INPUT_PULLUP);
+    pinMode(SLEEP_RESET_PIN, OUTPUT);
+    pinMode(POT_PIN, INPUT);
+
+    digitalWrite(SLEEP_RESET_PIN, HIGH);
+    disableDriver();
+
+    stepper.setMaxSpeed(1500);      // requested
+    stepper.setAcceleration(8000);  // requested
+
+    performHoming();
+}
+
+void handleEStop() {
+    stepper.stop();
+    disableDriver();
+    pixel.setPixelColor(0, pixel.Color(255, 0, 0));
+    pixel.show();
+}
+
+// ===============================
+// I2C (CORE 1)
+// ===============================
+
+void onI2CReceive(int numBytes) {
+    if (numBytes != sizeof(steeringpacket)) return;
+
+    steeringpacket pkt;
+    Wire1.readBytes((char*)&pkt, sizeof(pkt));
+
+    lock_shared();
+    shared_state.latest_packet = pkt;
+    shared_state.last_packet_ms = millis();
+    shared_state.estop_from_master = pkt.estop;  // live, not latched
+    shared_state.seen_packet = true;
+    unlock_shared();
+}
+
+void onI2CRequest() {
+    Wire1.write(shared_state.estop_from_device ? 1 : 0);
+}
+
+void core1_entry() {
+    Wire1.setSDA(10);
+    Wire1.setSCL(11);
+    Wire1.begin(DEVICE_I2C_ADDRESS);
+    Wire1.onReceive(onI2CReceive);
+    Wire1.onRequest(onI2CRequest);
+    while (true) tight_loop_contents();
+}
+
+// ===============================
+// MAIN
+// ===============================
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    lockPtr = spin_lock_instance(5);
+
+    lock_shared();
+    memset(&shared_state, 0, sizeof(shared_state));
+    shared_state.last_packet_ms = millis();
+    unlock_shared();
+
+    deviceSetup();
+    multicore_launch_core1(core1_entry);
+}
+
+void loop() {
+    steeringpacket pkt;
+    bool masterEStop;
+    bool deviceEStop;
+    uint32_t lastPkt;
+
+    lock_shared();
+    pkt          = shared_state.latest_packet;
+    masterEStop  = shared_state.estop_from_master;   // live
+    deviceEStop  = shared_state.estop_from_device;   // latched
+    lastPkt      = shared_state.last_packet_ms;
+    unlock_shared();
+
+    // Packet timeout, device estop latch
+    if ((millis() - lastPkt) > PACKET_TIMEOUT_MS) {
+        triggerEstop("Packet timeout");
+        deviceEStop = true;
+    }
+
+    // Master estop (live)
+    if (masterEStop) {
+        handleEStop();
+        return;
+    }
+
+    // Device estop (latched)
+    if (deviceEStop) {
+        handleEStop();
+        return;
+    }
+
+    checkDriverFault();
+
+    int targetPot = constrain(
+        commandToPotTarget(pkt.position),
+        POT_MIN,
+        POT_MAX
+    );
+
+    driveTowardTarget(targetPot);
+}
