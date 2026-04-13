@@ -59,7 +59,6 @@ struct SharedState {
     uint32_t last_packet_ms;
     bool estop_from_master;
     bool estop_from_device;
-    bool seen_packet;
     char estop_reason[64];
 };
 
@@ -218,16 +217,44 @@ void handleEStop() {
 // ===============================
 
 void onI2CReceive(int numBytes) {
-    if (numBytes != sizeof(steeringpacket)) return;
+    if (numBytes <= 0) return;
 
+    last_command_was_poll = false;
+
+    // If it's a single byte, it may be a poll command
+    if (numBytes == 1) {
+        uint8_t cmd = Wire1.read();
+        if (cmd == POLL_COMMAND) {
+            last_command_was_poll = true;
+        }
+        return;
+    }
+    // Check Packet type
+    if ((pkt.device_type & 0xF0) != (DEVICE_I2C_ADDRESS & 0xF0)) {
+        while (Wire1.available()) Wire1.read();
+        return;
+    }
+    //devices require EXACT size match
+    if (numBytes != sizeof(steeringpacket)) {
+        while (Wire1.available()) Wire1.read();
+        return;
+    }
+
+    // Read packet
     steeringpacket pkt;
-    Wire1.readBytes((char*)&pkt, sizeof(pkt));
+    int r = Wire1.readBytes((char*)&pkt, sizeof(pkt));
+    if (r != sizeof(pkt)) {
+        while (Wire1.available()) Wire1.read();
+        return;
+    }
 
+    uint32_t now = millis();
+
+    // Update shared state safely
     lock_shared();
-    shared_state.latest_packet = pkt;
-    shared_state.last_packet_ms = millis();
-    shared_state.estop_from_master = pkt.estop;  // live, not latched
-    shared_state.seen_packet = true;
+    shared_state.latest_packet    = pkt;
+    shared_state.last_packet_ms   = now;
+    shared_state.estop_from_master = (pkt.estop != 0);
     unlock_shared();
 }
 

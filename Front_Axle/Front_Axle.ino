@@ -218,6 +218,12 @@ void onI2CReceive(int numBytes) {
         }
         return;
     }
+    // Check Packet type
+    if ((pkt.device_type & 0xF0) != (DEVICE_I2C_ADDRESS & 0xF0)) {
+        while (Wire1.available()) Wire1.read();
+        return;
+    }
+
 
     // Axle devices require EXACT size match
     if (numBytes != sizeof(axlepacket)) {
